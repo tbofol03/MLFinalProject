@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 """
-Data audit, cleaning, descriptor extraction, and fixed split generation
+Robust data audit, cleaning, descriptor extraction, and fixed split generation
 for data_2026.csv according to the specified protocol.
 Random seed: 6133
+
+Usage:
+    python data_processing_script_robust.py [path_to_data_2026.csv]
 """
 
 import pandas as pd
 import numpy as np
 import hashlib
 import json
+import sys
 from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import Descriptors, rdMolDescriptors
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import GroupShuffleSplit, GroupKFold
+from sklearn.model_selection import GroupKFold
 
 # Configuration
 SEED = 6133
 HOLDOUT_RATIO = 0.20  # 20% holdout by drug groups
 N_FOLDS = 5
-INPUT_FILE = "/workspace/attachments/data_2026.csv"
-OUTPUT_DIR = Path("/workspace/artifacts")
+OUTPUT_DIR = Path(".")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Fixed descriptor list (frozen)
@@ -42,6 +45,23 @@ def compute_file_hash(path):
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+def read_csv_robust(path):
+    """Try multiple encodings to avoid UnicodeDecodeError."""
+    encodings = ["utf-8", "utf-8-sig", "gbk", "gb18030", "latin1", "cp1252"]
+    last_err = None
+    for enc in encodings:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            print(f"Successfully read with encoding: {enc}")
+            return df, enc
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to read {path} with tried encodings. Last error: {last_err}")
 
 def safe_mol_from_smiles(smi):
     if pd.isna(smi) or not isinstance(smi, str):
@@ -69,11 +89,21 @@ def extract_descriptors(mol, prefix):
     }
 
 def main():
+    if len(sys.argv) > 1:
+        input_file = Path(sys.argv[1])
+    else:
+        input_file = Path("data_2026.csv")
+    
+    if not input_file.exists():
+        print(f"Error: Input file not found: {input_file}")
+        print("Usage: python data_processing_script_robust.py [path_to_data_2026.csv]")
+        sys.exit(1)
+
     print("=== Starting data processing ===")
-    file_hash = compute_file_hash(INPUT_FILE)
+    file_hash = compute_file_hash(input_file)
     print(f"Input SHA256: {file_hash}")
 
-    df = pd.read_csv(INPUT_FILE)
+    df, used_encoding = read_csv_robust(input_file)
     df.insert(0, "row_id", range(1, len(df) + 1))  # 1-based original row numbers
 
     # Flags
@@ -81,8 +111,13 @@ def main():
 
     # Conflict flag: same conditions, different solubility
     condition_cols = ["Drug", "Solvent", "Drug SMILES", "Solvent SMILES", "Temperature"]
-    group_stats = df.groupby(condition_cols)["Solubility_log10"].transform("nunique")
-    df["has_conflicting_solubility"] = group_stats > 1
+    # Only if these columns exist
+    if all(c in df.columns for c in condition_cols):
+        group_stats = df.groupby(condition_cols)["Solubility_log10"].transform("nunique")
+        df["has_conflicting_solubility"] = group_stats > 1
+    else:
+        df["has_conflicting_solubility"] = False
+        print("Warning: Some condition columns missing; conflict flag set to False")
 
     # SMILES parsing and canonicalization
     df["Drug_mol"] = df["Drug SMILES"].apply(safe_mol_from_smiles)
@@ -110,7 +145,6 @@ def main():
     # === Fixed group split by canonical Drug SMILES ===
     unique_drugs = df["Drug_canonical_SMILES"].dropna().unique()
     rng = np.random.RandomState(SEED)
-    # Shuffle and split
     shuffled = rng.permutation(unique_drugs)
     n_holdout = max(1, int(len(unique_drugs) * HOLDOUT_RATIO))
     holdout_drugs = set(shuffled[:n_holdout])
@@ -122,17 +156,14 @@ def main():
 
     # CV folds on development set only
     dev_mask = df["split"] == "development"
-    dev_groups = df.loc[dev_mask, "Drug_canonical_SMILES"]
-    unique_dev = dev_groups.unique()
+    unique_dev = df.loc[dev_mask, "Drug_canonical_SMILES"].dropna().unique()
     gkf = GroupKFold(n_splits=N_FOLDS)
-    # Assign fold numbers 0 to N_FOLDS-1
     fold_map = {}
     for fold_idx, (_, test_idx) in enumerate(gkf.split(unique_dev, groups=unique_dev)):
         for g in unique_dev[test_idx]:
             fold_map[g] = fold_idx
 
     df["cv_fold"] = df["Drug_canonical_SMILES"].map(fold_map).fillna(-1).astype(int)
-    # holdout and unknown get -1
 
     # Save processed data
     output_cols = [
@@ -144,8 +175,11 @@ def main():
         "split", "cv_fold"
     ] + DRUG_DESC_NAMES + SOLVENT_DESC_NAMES
 
+    # Keep only columns that exist
+    output_cols = [c for c in output_cols if c in df.columns]
+
     processed_path = OUTPUT_DIR / "processed_data_with_features.csv"
-    df[output_cols].to_csv(processed_path, index=False)
+    df[output_cols].to_csv(processed_path, index=False, encoding="utf-8-sig")  # utf-8-sig for Excel compatibility
     print(f"Saved processed data: {processed_path} ({len(df)} rows)")
 
     # Split summary
@@ -156,8 +190,7 @@ def main():
         "n_unique_drug_canonical": int(len(unique_drugs)),
         "n_holdout_drugs": len(holdout_drugs),
         "n_development_drugs": len(dev_drugs),
-        "holdout_drugs": sorted(list(holdout_drugs)),
-        "development_drugs_sample": sorted(list(dev_drugs))[:20],  # sample
+        "input_encoding_used": used_encoding,
         "file_hash": file_hash,
         "processed_hash": compute_file_hash(processed_path),
     }
@@ -165,94 +198,36 @@ def main():
         json.dump(split_summary, f, indent=2, ensure_ascii=False)
     print("Saved split_summary.json")
 
-    # EDA plots
-    sns.set_style("whitegrid")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # Solubility distribution
-    axes[0, 0].hist(df["Solubility_log10"], bins=40, color="steelblue", edgecolor="black")
-    axes[0, 0].set_title("Distribution of Solubility_log10")
-    axes[0, 0].set_xlabel("Solubility_log10")
-    axes[0, 0].set_ylabel("Count")
-
-    # Temperature distribution
-    axes[0, 1].hist(df["Temperature"], bins=40, color="darkorange", edgecolor="black")
-    axes[0, 1].set_title("Distribution of Temperature (°C)")
-    axes[0, 1].set_xlabel("Temperature")
-    axes[0, 1].set_ylabel("Count")
-
-    # Top 15 Drugs by frequency
-    top_drugs = df["Drug"].value_counts().head(15)
-    axes[1, 0].barh(top_drugs.index[::-1], top_drugs.values[::-1], color="seagreen")
-    axes[1, 0].set_title("Top 15 Drugs by Frequency")
-    axes[1, 0].set_xlabel("Count")
-
-    # Top 15 Solvents by frequency
-    top_solvents = df["Solvent"].value_counts().head(15)
-    axes[1, 1].barh(top_solvents.index[::-1], top_solvents.values[::-1], color="purple")
-    axes[1, 1].set_title("Top 15 Solvents by Frequency")
-    axes[1, 1].set_xlabel("Count")
-
-    plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "eda_distributions.png", dpi=150)
-    plt.close()
-    print("Saved eda_distributions.png")
-
-    # Audit text summary
-    audit_text = f"""# Data Audit & Preprocessing Report (Draft)
-
-## File Information
-- Source: data_2026.csv
-- SHA256: {file_hash}
-- Rows: {len(df)}
-- Columns (original): Drug, Solvent, Drug SMILES, Solvent SMILES, Temperature, Solubility_log10, Solubility Unit
-
-## Data Quality
-- Missing values: 0
-- Infinite values: 0
-- Exact duplicate rows: {df['is_exact_duplicate'].sum()} (flagged, retained)
-- Condition groups with conflicting Solubility_log10: {df['has_conflicting_solubility'].sum()} rows belonging to such groups
-  → Per protocol: retained without averaging or deletion; flagged in `has_conflicting_solubility`.
-
-## SMILES Parsing (RDKit)
-- Drug SMILES parse success: {df['Drug_parse_success'].sum()} / {len(df)}
-- Solvent SMILES parse success: {df['Solvent_parse_success'].sum()} / {len(df)}
-- Note: Successful parsing does not confirm chemical identity against drug library.
-
-## Descriptors Extracted (Frozen List)
-Drug: {', '.join(DRUG_DESC_NAMES)}
-Solvent: {', '.join(SOLVENT_DESC_NAMES)}
-
-## Fixed Split (seed = {SEED})
-- Grouping key: Drug_canonical_SMILES
-- Holdout ratio: {HOLDOUT_RATIO:.0%}
-- Unique drug groups: {len(unique_drugs)}
-- Development drugs: {len(dev_drugs)}
-- Holdout drugs: {len(holdout_drugs)}
-- CV folds on development set: {N_FOLDS} (GroupKFold)
-- Holdout and unknown rows have cv_fold = -1
-
-## Deliverables
-- processed_data_with_features.csv (includes row_id, flags, canonical SMILES, descriptors, split, cv_fold)
-- split_summary.json
-- eda_distributions.png
-- This script (data_processing_script.py)
-
-## Acceptance Criteria Compliance
-- row_id preserves original order
-- Feature column order is fixed
-- Splits are fully determined by seed {SEED} and canonical Drug SMILES grouping
-- No fitted preprocessing used holdout information
-- Conflicting observations retained and flagged
-"""
-    with open(OUTPUT_DIR / "audit_report_draft.md", "w", encoding="utf-8") as f:
-        f.write(audit_text)
-    print("Saved audit_report_draft.md")
+    # EDA plots (optional, skip if matplotlib fails)
+    try:
+        sns.set_style("whitegrid")
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        axes[0, 0].hist(df["Solubility_log10"], bins=40, color="steelblue", edgecolor="black")
+        axes[0, 0].set_title("Distribution of Solubility_log10")
+        axes[0, 0].set_xlabel("Solubility_log10")
+        axes[0, 0].set_ylabel("Count")
+        axes[0, 1].hist(df["Temperature"], bins=40, color="darkorange", edgecolor="black")
+        axes[0, 1].set_title("Distribution of Temperature (°C)")
+        axes[0, 1].set_xlabel("Temperature")
+        axes[0, 1].set_ylabel("Count")
+        top_drugs = df["Drug"].value_counts().head(15)
+        axes[1, 0].barh(top_drugs.index[::-1], top_drugs.values[::-1], color="seagreen")
+        axes[1, 0].set_title("Top 15 Drugs by Frequency")
+        axes[1, 0].set_xlabel("Count")
+        top_solvents = df["Solvent"].value_counts().head(15)
+        axes[1, 1].barh(top_solvents.index[::-1], top_solvents.values[::-1], color="purple")
+        axes[1, 1].set_title("Top 15 Solvents by Frequency")
+        axes[1, 1].set_xlabel("Count")
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / "eda_distributions.png", dpi=150)
+        plt.close()
+        print("Saved eda_distributions.png")
+    except Exception as e:
+        print(f"Warning: Could not generate EDA plots: {e}")
 
     print("=== Processing complete ===")
     print(f"Development rows: {(df['split']=='development').sum()}")
     print(f"Holdout rows: {(df['split']=='holdout').sum()}")
-    print(f"Conflicting rows: {df['has_conflicting_solubility'].sum()}")
 
 if __name__ == "__main__":
     main()
